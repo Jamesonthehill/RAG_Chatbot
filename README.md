@@ -2,7 +2,11 @@
 
 A clean personal workspace for a retrieval-augmented chatbot.
 
-The backend indexes local Markdown/text notes, retrieves relevant chunks, and answers questions. If `OPENAI_API_KEY` is set, it uses OpenAI for generation. If not, it still returns a grounded extractive answer from your documents.
+The backend indexes course documents with OpenAI embeddings, retrieves relevant
+PostgreSQL chunks, and generates grounded Socratic responses. When
+`GROQ_API_KEY` is configured, Groq generates tutor responses; otherwise the app
+uses OpenAI. Without either generation key, it returns a grounded extractive
+answer from the retrieved documents.
 
 ## Setup
 
@@ -14,7 +18,23 @@ python -m pip install -r backend/requirements.txt
 cp .env.example .env
 ```
 
-Add an OpenAI key to `.env` if you want generated answers.
+Add `OPENAI_API_KEY` for document embeddings. Add `GROQ_API_KEY` to use Groq for
+the tutor responses. Groq generation uses the OpenAI-compatible endpoint and
+does not replace the existing OpenAI embedding pipeline.
+
+### Groq generation
+
+The backend automatically prefers Groq when `GROQ_API_KEY` is present:
+
+```env
+GROQ_API_KEY=your-groq-key
+GROQ_API_BASE_URL=https://api.groq.com/openai/v1
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+Keep `OPENAI_API_KEY` configured because document ingestion and query retrieval
+still use `text-embedding-3-small` with 1,536 dimensions. Restart the service
+after changing these variables.
 
 ## Add Documents
 

@@ -383,12 +383,34 @@ def answer_format_instruction(question: str) -> str:
     return "Prefer short paragraphs and bullets when they improve readability."
 
 
+def generation_client_config() -> tuple[str, str, str, str] | None:
+    """Select Groq for tutor generation, with OpenAI as a compatible fallback."""
+
+    if settings.GROQ_API_KEY:
+        return (
+            "Groq",
+            settings.GROQ_API_KEY,
+            settings.GROQ_API_BASE_URL,
+            settings.GROQ_MODEL,
+        )
+    if settings.OPENAI_API_KEY:
+        return (
+            "OpenAI",
+            settings.OPENAI_API_KEY,
+            settings.OPENAI_API_BASE_URL,
+            settings.RAG_MODEL,
+        )
+    return None
+
+
 async def generate_answer(question: str, history: list[ChatMessage], sources: list[Source]) -> str:
-    if not settings.OPENAI_API_KEY:
+    client_config = generation_client_config()
+    if client_config is None:
         return fallback_answer(question, sources)
 
     from openai import AsyncOpenAI
 
+    provider, api_key, base_url, model = client_config
     socratic_decision = choose_socratic_strategy(question, history, sources)
     context = "\n\n".join(f"[{index + 1}] {source.title}\n{source.text}" for index, source in enumerate(sources))
     messages = [
@@ -408,17 +430,17 @@ async def generate_answer(question: str, history: list[ChatMessage], sources: li
     ]
 
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_API_BASE_URL)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         response = await client.chat.completions.create(
-            model=settings.RAG_MODEL,
+            model=model,
             messages=messages,
             temperature=settings.RAG_TEMPERATURE,
         )
         raw_answer = response.choices[0].message.content or fallback_answer(question, sources)
         return enforce_socratic_response(raw_answer, question, socratic_decision)
     except Exception:
-        # Keep the course chatbot useful if OpenAI is temporarily unavailable,
+        # Keep the course chatbot useful if the generation provider is temporarily unavailable,
         # rate-limited, or rejects a model-specific option.
-        LOGGER.exception("OpenAI answer generation failed; returning the grounded fallback answer.")
+        LOGGER.exception("%s answer generation failed; returning the grounded fallback answer.", provider)
         fallback = fallback_answer(question, sources)
         return enforce_socratic_response(fallback, question, socratic_decision)

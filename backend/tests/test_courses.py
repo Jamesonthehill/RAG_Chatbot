@@ -187,7 +187,7 @@ class CourseRagIsolationTests(unittest.TestCase):
         self.assertIn("Assignment", instruction)
         self.assertIn("Requirements", instruction)
 
-    def test_openai_failure_returns_grounded_fallback(self) -> None:
+    def test_generation_failure_returns_grounded_fallback(self) -> None:
         class FailingCompletions:
             async def create(self, **kwargs):
                 self.kwargs = kwargs
@@ -209,6 +209,7 @@ class CourseRagIsolationTests(unittest.TestCase):
         fake_openai = SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI)
 
         with (
+            patch.object(settings, "GROQ_API_KEY", ""),
             patch.object(settings, "OPENAI_API_KEY", "test-key"),
             patch.dict(sys.modules, {"openai": fake_openai}),
             self.assertLogs("app.rag", level="ERROR"),
@@ -217,6 +218,46 @@ class CourseRagIsolationTests(unittest.TestCase):
 
         self.assertIn("The group project has three parts.", answer)
         self.assertNotIn("reasoning_effort", completions.kwargs)
+
+    def test_groq_is_preferred_for_tutor_generation(self) -> None:
+        created_clients = []
+
+        class SuccessfulCompletions:
+            async def create(self, **kwargs):
+                self.kwargs = kwargs
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="What evidence supports that idea?"))]
+                )
+
+        completions = SuccessfulCompletions()
+
+        class FakeAsyncOpenAI:
+            def __init__(self, **kwargs):
+                created_clients.append(kwargs)
+                self.chat = SimpleNamespace(completions=completions)
+
+        source = rag.Source(
+            document_id="doc-a",
+            chunk_id="doc-a:0",
+            title="course-notes.txt",
+            text="Version control records changes over time.",
+            score=1.0,
+        )
+        fake_openai = SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI)
+
+        with (
+            patch.object(settings, "GROQ_API_KEY", "groq-test-key"),
+            patch.object(settings, "GROQ_API_BASE_URL", "https://api.groq.com/openai/v1"),
+            patch.object(settings, "GROQ_MODEL", "llama-3.3-70b-versatile"),
+            patch.object(settings, "OPENAI_API_KEY", "openai-test-key"),
+            patch.dict(sys.modules, {"openai": fake_openai}),
+        ):
+            answer = asyncio.run(rag.generate_answer("What is version control?", [], [source]))
+
+        self.assertTrue(answer)
+        self.assertEqual(created_clients[0]["api_key"], "groq-test-key")
+        self.assertEqual(created_clients[0]["base_url"], "https://api.groq.com/openai/v1")
+        self.assertEqual(completions.kwargs["model"], "llama-3.3-70b-versatile")
 
     @patch("app.rag.create_embeddings", return_value=[[0.1] * 1536])
     @patch("app.rag.db.replace_document_chunks", return_value=1)
