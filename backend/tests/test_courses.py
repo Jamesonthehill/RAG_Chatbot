@@ -248,7 +248,7 @@ class CourseRagIsolationTests(unittest.TestCase):
         with (
             patch.object(settings, "GROQ_API_KEY", "groq-test-key"),
             patch.object(settings, "GROQ_API_BASE_URL", "https://api.groq.com/openai/v1"),
-            patch.object(settings, "GROQ_MODEL", "llama-3.3-70b-versatile"),
+            patch.object(settings, "GROQ_MODEL", "openai/gpt-oss-120b"),
             patch.object(settings, "OPENAI_API_KEY", "openai-test-key"),
             patch.dict(sys.modules, {"openai": fake_openai}),
         ):
@@ -257,7 +257,7 @@ class CourseRagIsolationTests(unittest.TestCase):
         self.assertTrue(answer)
         self.assertEqual(created_clients[0]["api_key"], "groq-test-key")
         self.assertEqual(created_clients[0]["base_url"], "https://api.groq.com/openai/v1")
-        self.assertEqual(completions.kwargs["model"], "llama-3.3-70b-versatile")
+        self.assertEqual(completions.kwargs["model"], "openai/gpt-oss-120b")
 
     @patch("app.rag.create_embeddings", return_value=[[0.1] * 1536])
     @patch("app.rag.db.replace_document_chunks", return_value=1)

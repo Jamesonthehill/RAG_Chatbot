@@ -29,7 +29,7 @@ The backend automatically prefers Groq when `GROQ_API_KEY` is present:
 ```env
 GROQ_API_KEY=your-groq-key
 GROQ_API_BASE_URL=https://api.groq.com/openai/v1
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 ```
 
 Keep `OPENAI_API_KEY` configured because document ingestion and query retrieval
