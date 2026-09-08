@@ -23,6 +23,7 @@ RAG_TEMPERATURE = float(os.getenv("RAG_TEMPERATURE", "0.2"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+DEBUG_PIPELINE_LOGS = os.getenv("DEBUG_PIPELINE_LOGS", "false").lower() in {"1", "true", "yes"}
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")

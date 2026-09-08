@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import secrets
 import smtplib
+from time import monotonic
+import uuid
 from email.message import EmailMessage
 from urllib.parse import quote, urlencode
 
@@ -16,6 +19,14 @@ from google.oauth2 import id_token as google_id_token
 
 from app import auth, db, settings
 from app.classifier import classify_message
+from app.pipeline_logging import (
+    begin_trace,
+    debug_digest,
+    end_trace,
+    log_event,
+    log_exception,
+    set_conversation_id,
+)
 from app.guided_lessons import (
     advance_use_case_lesson,
     lesson_exit_requested,
@@ -1043,8 +1054,13 @@ def _off_topic_answer(message: str) -> str | None:
     )
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
+def _save_assistant_message(conversation_id: str, answer: str) -> None:
+    log_event(11, "conversation_save_started", role="assistant")
+    db.add_message(conversation_id, "assistant", answer)
+    log_event(11, "conversation_saved", role="assistant")
+
+
+async def _run_chat_pipeline(payload: ChatRequest, request: Request) -> ChatResponse:
     conversation_id = payload.conversation_id
     course_id = payload.course_id
     history = payload.history
@@ -1054,6 +1070,7 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     if not course_id:
         raise HTTPException(status_code=400, detail="Choose an approved course before opening the chatbot.")
     _require_course_access(request, course_id)
+    log_event(2, "course_access_validated", course_id=course_id)
 
     if db.is_enabled():
         conversation_id = db.ensure_conversation(
@@ -1062,24 +1079,31 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             user_id=user_id,
             course_id=course_id,
         )
+        set_conversation_id(conversation_id)
+        log_event(3, "conversation_ready", database_enabled=True)
         if not db.conversation_belongs_to_course(conversation_id, user_id, course_id):
             raise HTTPException(status_code=409, detail="This conversation belongs to a different course.")
         stored_history = db.get_messages(conversation_id, limit=8)
         history = stored_history or payload.history
+        log_event(3, "history_loaded", messages=len(history), source="database" if stored_history else "request")
         db.add_message(conversation_id, "user", payload.message)
+        log_event(3, "user_message_saved")
         if hasattr(db, "get_guided_lesson_state"):
             guided_state = db.get_guided_lesson_state(conversation_id)
 
         off_topic_answer = _off_topic_answer(payload.message)
         if off_topic_answer:
+            log_event(4, "route_selected", route="off_topic_guard")
             if hasattr(db, "clear_pending_clarification"):
                 db.clear_pending_clarification(conversation_id)
-            db.add_message(conversation_id, "assistant", off_topic_answer)
+            _save_assistant_message(conversation_id, off_topic_answer)
             return ChatResponse(answer=off_topic_answer, conversation_id=conversation_id, sources=[])
 
         pending = db.get_pending_clarification(conversation_id) if hasattr(db, "get_pending_clarification") else None
         if pending:
+            log_event(4, "route_selected", route="pending_clarification")
             combined_query = f"{pending['original_question']} {payload.message}".strip()
+            debug_digest("combined_query", combined_query)
             if hasattr(db, "clear_pending_clarification"):
                 db.clear_pending_clarification(conversation_id)
             sources = retrieve(
@@ -1091,25 +1115,30 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             answer = await generate_answer(combined_query, history, sources)
             if answer.lower().startswith("i do not know from your uploaded notes"):
                 sources = []
-            db.add_message(conversation_id, "assistant", answer)
+            _save_assistant_message(conversation_id, answer)
             return ChatResponse(answer=answer, conversation_id=conversation_id, sources=sources)
+    else:
+        log_event(3, "history_loaded", messages=len(history), source="request")
 
     current_files = db.list_rag_files(course_id=course_id) if db.is_enabled() else []
     course = db.get_course(course_id) if db.is_enabled() else None
+    log_event(3, "course_context_loaded", files=len(current_files), course_found=course is not None)
     course_answer = _course_context_answer(course, current_files, payload.message) if course else None
     if course_answer:
+        log_event(4, "route_selected", route="course_context_answer")
         if db.is_enabled() and conversation_id:
             if hasattr(db, "clear_pending_clarification"):
                 db.clear_pending_clarification(conversation_id)
-            db.add_message(conversation_id, "assistant", course_answer)
+            _save_assistant_message(conversation_id, course_answer)
         return ChatResponse(answer=course_answer, conversation_id=conversation_id or "local", sources=[])
 
     file_state_answer = _file_state_answer(current_files, payload.message) or _small_status_answer(current_files, payload.message)
     if file_state_answer:
+        log_event(4, "route_selected", route="file_status_answer")
         if db.is_enabled() and conversation_id:
             if hasattr(db, "clear_pending_clarification"):
                 db.clear_pending_clarification(conversation_id)
-            db.add_message(conversation_id, "assistant", file_state_answer)
+            _save_assistant_message(conversation_id, file_state_answer)
         return ChatResponse(answer=file_state_answer, conversation_id=conversation_id or "local", sources=[])
 
     if db.is_enabled() and conversation_id:
@@ -1118,9 +1147,10 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             guided_state = None
 
         if guided_state and lesson_exit_requested(payload.message):
+            log_event(4, "route_selected", route="guided_lesson_exit")
             db.clear_guided_lesson_state(conversation_id)
             answer = "The guided use case lesson is paused. Ask any course question when you are ready."
-            db.add_message(conversation_id, "assistant", answer)
+            _save_assistant_message(conversation_id, answer)
             return ChatResponse(answer=answer, conversation_id=conversation_id, sources=[])
 
         if guided_state and unrelated_new_topic(payload.message):
@@ -1129,6 +1159,7 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
 
         guided_requested = guided_state is not None or matches_use_case_lesson(payload.message)
         if guided_requested:
+            log_event(4, "route_selected", route="guided_lesson")
             sources = retrieve(
                 lesson_search_query(payload.message),
                 top_k=payload.top_k,
@@ -1142,7 +1173,7 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
                     else start_use_case_lesson()
                 )
                 db.save_guided_lesson_state(conversation_id, turn.state)
-                db.add_message(conversation_id, "assistant", turn.answer)
+                _save_assistant_message(conversation_id, turn.answer)
                 return ChatResponse(
                     answer=turn.answer,
                     conversation_id=conversation_id,
@@ -1155,28 +1186,39 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
                 "I do not know from your uploaded notes. The published course materials do not "
                 "currently contain instruction about use case diagrams."
             )
-            db.add_message(conversation_id, "assistant", answer)
+            _save_assistant_message(conversation_id, answer)
             return ChatResponse(answer=answer, conversation_id=conversation_id, sources=[])
 
+    log_event(4, "message_classification_started")
     classification = await classify_message(payload.message, history)
+    log_event(
+        4,
+        "message_classification_completed",
+        needs_clarification=classification.needs_clarification,
+        direct_answer=classification.direct_answer is not None,
+        query_rewritten=bool(classification.rewritten_query and classification.rewritten_query != payload.message),
+    )
 
     if classification.needs_clarification:
+        log_event(4, "route_selected", route="clarification_response")
         answer = classification.clarification_question or "Could you clarify what you want to know?"
         if db.is_enabled() and conversation_id:
             if hasattr(db, "set_pending_clarification"):
                 db.set_pending_clarification(conversation_id, payload.message, classification.target)
-            db.add_message(conversation_id, "assistant", answer)
+            _save_assistant_message(conversation_id, answer)
         return ChatResponse(answer=answer, conversation_id=conversation_id or "local", sources=[])
 
     if classification.direct_answer:
+        log_event(4, "route_selected", route="classified_direct_answer")
         answer = classification.direct_answer
         if db.is_enabled() and conversation_id:
             if hasattr(db, "clear_pending_clarification"):
                 db.clear_pending_clarification(conversation_id)
-            db.add_message(conversation_id, "assistant", answer)
+            _save_assistant_message(conversation_id, answer)
         return ChatResponse(answer=answer, conversation_id=conversation_id or "local", sources=[])
 
     query = classification.rewritten_query or payload.message
+    log_event(4, "route_selected", route="rag_generation")
     sources = retrieve(
         query,
         top_k=payload.top_k,
@@ -1196,8 +1238,53 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     if db.is_enabled() and conversation_id:
         if hasattr(db, "clear_pending_clarification"):
             db.clear_pending_clarification(conversation_id)
-        db.add_message(conversation_id, "assistant", answer)
+        _save_assistant_message(conversation_id, answer)
 
     return ChatResponse(answer=answer, conversation_id=conversation_id or "local", sources=sources)
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
+    trace_id = uuid.uuid4().hex
+    tokens = begin_trace(trace_id, payload.conversation_id)
+    started = monotonic()
+    log_event(
+        1,
+        "chat_received",
+        course_id=payload.course_id,
+        message_chars=len(payload.message),
+        request_history_messages=len(payload.history),
+    )
+    debug_digest("user_message", payload.message)
+    try:
+        response = await _run_chat_pipeline(payload, request)
+        set_conversation_id(response.conversation_id)
+        log_event(
+            12,
+            "response_returned",
+            sources=len(response.sources),
+            response_chars=len(response.answer),
+            latency_ms=round((monotonic() - started) * 1000),
+        )
+        return response
+    except HTTPException as error:
+        log_event(
+            "error",
+            "chat_rejected",
+            level=logging.WARNING,
+            status_code=error.status_code,
+            latency_ms=round((monotonic() - started) * 1000),
+        )
+        raise
+    except Exception as error:
+        log_exception(
+            "error",
+            "chat_failed",
+            error,
+            latency_ms=round((monotonic() - started) * 1000),
+        )
+        raise
+    finally:
+        end_trace(tokens)
 
 app.mount("/", StaticFiles(directory=settings.FRONTEND_DIR, html=True), name="frontend")

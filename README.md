@@ -144,6 +144,19 @@ The app creates these tables automatically on startup:
 - `conversations`
 - `conversation_messages`
 
+## Chat pipeline logs on Render
+
+Each `POST /api/chat` request writes concise structured events to stdout with a
+unique `trace_id`. Render is configured with `PYTHONUNBUFFERED=1`, so these
+events appear immediately in the service's Application Logs. Search for the
+exact field `trace_id=<id>` to follow one request across routing, retrieval,
+generation, validation, saving, and response return.
+
+Message, prompt, response, and retrieved-document content is never logged.
+Setting `DEBUG_PIPELINE_LOGS=true` adds only character counts and non-reversible
+SHA-256 content fingerprints for correlation during development. It remains
+disabled by default.
+
 Check the connection:
 
 ```text
