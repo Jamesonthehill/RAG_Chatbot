@@ -39,6 +39,25 @@ class PipelineLoggingTests(unittest.TestCase):
         self.assertIn("sha256=", output)
         self.assertNotIn(sensitive_text, output)
 
+    def test_debug_preview_redacts_secrets_and_truncates_content(self) -> None:
+        sensitive_text = "Email student@example.edu api_key=secret-value " + ("course material " * 30)
+        tokens = pipeline_logging.begin_trace("trace-123", "conversation-456")
+        try:
+            with (
+                patch.object(pipeline_logging.settings, "DEBUG_PIPELINE_LOGS", True),
+                self.assertLogs("app.pipeline", level="INFO") as captured,
+            ):
+                pipeline_logging.debug_preview("retrieved_chunk", sensitive_text, max_chars=80)
+        finally:
+            pipeline_logging.end_trace(tokens)
+
+        output = "\n".join(captured.output)
+        self.assertIn("[redacted-email]", output)
+        self.assertIn("[redacted-secret]", output)
+        self.assertIn("\\u2026", output)
+        self.assertNotIn("student@example.edu", output)
+        self.assertNotIn("secret-value", output)
+
 
 if __name__ == "__main__":
     unittest.main()

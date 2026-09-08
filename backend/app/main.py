@@ -22,6 +22,7 @@ from app.classifier import classify_message
 from app.pipeline_logging import (
     begin_trace,
     debug_digest,
+    debug_preview,
     end_trace,
     log_event,
     log_exception,
@@ -1259,6 +1260,7 @@ async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     try:
         response = await _run_chat_pipeline(payload, request)
         set_conversation_id(response.conversation_id)
+        debug_preview("final_answer", response.answer)
         log_event(
             12,
             "response_returned",

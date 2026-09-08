@@ -152,10 +152,12 @@ events appear immediately in the service's Application Logs. Search for the
 exact field `trace_id=<id>` to follow one request across routing, retrieval,
 generation, validation, saving, and response return.
 
-Message, prompt, response, and retrieved-document content is never logged.
-Setting `DEBUG_PIPELINE_LOGS=true` adds only character counts and non-reversible
-SHA-256 content fingerprints for correlation during development. It remains
-disabled by default.
+Message and conversation-history content is never logged. Setting
+`DEBUG_PIPELINE_LOGS=true` adds redacted, truncated previews of retrieved chunks,
+fixed prompt instructions, the model candidate, and the validated final answer,
+along with character counts and non-reversible SHA-256 fingerprints. It never
+logs complete prompts or documents and remains disabled by default. Enable it
+only temporarily while diagnosing answer generation, then turn it off again.
 
 Check the connection:
 

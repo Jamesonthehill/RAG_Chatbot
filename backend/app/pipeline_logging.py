@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 import hashlib
+import json
 import logging
+import re
 import sys
 from typing import Any
 
@@ -19,6 +21,12 @@ LOGGER.propagate = False
 
 _trace_id: ContextVar[str | None] = ContextVar("pipeline_trace_id", default=None)
 _conversation_id: ContextVar[str | None] = ContextVar("pipeline_conversation_id", default=None)
+
+_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_SECRET_PATTERN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{8,}|(?:api[_-]?key|access[_-]?token|authorization)\s*[:=]\s*\S+)",
+    re.IGNORECASE,
+)
 
 
 def begin_trace(trace_id: str, conversation_id: str | None = None) -> tuple[Token, Token]:
@@ -44,13 +52,10 @@ def _field(value: Any) -> str:
         return "none"
     if isinstance(value, bool):
         return str(value).lower()
-    return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace(" ", "_")
-    )
+    text = str(value)
+    if any(character.isspace() for character in text) or "=" in text:
+        return json.dumps(text, ensure_ascii=True)
+    return text
 
 
 def log_event(stage: int | str, event: str, *, level: int = logging.INFO, **fields: Any) -> None:
@@ -88,3 +93,26 @@ def debug_digest(label: str, value: str) -> None:
         return
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
     log_event("debug", f"{label}_digest", chars=len(value), sha256=digest)
+
+
+def redacted_preview(value: str, max_chars: int = 240) -> str:
+    cleaned = " ".join(value.split())
+    cleaned = _EMAIL_PATTERN.sub("[redacted-email]", cleaned)
+    cleaned = _SECRET_PATTERN.sub("[redacted-secret]", cleaned)
+    if len(cleaned) > max_chars:
+        return f"{cleaned[:max_chars].rstrip()}…"
+    return cleaned
+
+
+def debug_preview(label: str, value: str, *, max_chars: int = 240, **fields: Any) -> None:
+    if not settings.DEBUG_PIPELINE_LOGS:
+        return
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    log_event(
+        "debug",
+        label,
+        chars=len(value),
+        sha256=digest,
+        preview=redacted_preview(value, max_chars=max_chars),
+        **fields,
+    )

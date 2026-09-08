@@ -9,7 +9,14 @@ from typing import Any
 
 from app import db, settings
 from app.chunking import CHUNKING_VERSION, chunk_document
-from app.pipeline_logging import debug_digest, log_event, log_exception, trace_active
+from app.pipeline_logging import (
+    debug_digest,
+    debug_preview,
+    log_event,
+    log_exception,
+    redacted_preview,
+    trace_active,
+)
 from app.schemas import ChatMessage, Source
 from app.socratic import choose_socratic_strategy, enforce_socratic_response, socratic_system_instruction
 
@@ -295,9 +302,19 @@ def retrieve(
 ) -> list[Source]:
     log_event(5, "retrieval_started", retrieval_type="hybrid", top_k=top_k)
     debug_digest("retrieval_query", query)
+    retrieval_started = monotonic()
     try:
         requested_assignments = requested_assignment_numbers(query)
+        embedding_started = monotonic()
         query_embedding = create_embeddings([query])[0]
+        log_event(
+            5,
+            "query_embedding_completed",
+            model=settings.EMBEDDING_MODEL,
+            dimensions=len(query_embedding),
+            latency_ms=round((monotonic() - embedding_started) * 1000),
+        )
+        search_started = monotonic()
         ranked = db.hybrid_search_chunks(
             query, query_embedding, top_k, conversation_id=conversation_id,
             course_id=course_id, assignment_numbers=requested_assignments,
@@ -312,7 +329,28 @@ def retrieve(
             )
             for item in ranked
         ]
-        log_event(5, "retrieval_completed", retrieval_type="hybrid", chunks=len(sources))
+        log_event(
+            5,
+            "hybrid_search_completed",
+            chunks=len(sources),
+            latency_ms=round((monotonic() - search_started) * 1000),
+        )
+        log_event(
+            5,
+            "retrieval_completed",
+            retrieval_type="hybrid",
+            chunks=len(sources),
+            latency_ms=round((monotonic() - retrieval_started) * 1000),
+        )
+        for rank, source in enumerate(sources, start=1):
+            debug_preview(
+                "retrieved_chunk",
+                source.text,
+                max_chars=180,
+                rank=rank,
+                title=redacted_preview(source.title, max_chars=80),
+                score=round(source.score, 6),
+            )
         return sources
     except Exception as error:
         log_exception(5, "retrieval_failed", error, retrieval_type="hybrid")
@@ -347,6 +385,7 @@ def retrieve_overview(
     if not conversation_id and not course_id:
         return []
     log_event(5, "retrieval_started", retrieval_type="overview", top_k=top_k)
+    retrieval_started = monotonic()
     try:
         matches = db.overview_chunks(conversation_id, course_id, top_k)
         sources = [
@@ -359,7 +398,22 @@ def retrieve_overview(
             )
             for item in matches
         ]
-        log_event(5, "retrieval_completed", retrieval_type="overview", chunks=len(sources))
+        log_event(
+            5,
+            "retrieval_completed",
+            retrieval_type="overview",
+            chunks=len(sources),
+            latency_ms=round((monotonic() - retrieval_started) * 1000),
+        )
+        for rank, source in enumerate(sources, start=1):
+            debug_preview(
+                "retrieved_chunk",
+                source.text,
+                max_chars=180,
+                rank=rank,
+                title=redacted_preview(source.title, max_chars=80),
+                score=round(source.score, 6),
+            )
         return sources
     except Exception as error:
         log_exception(5, "retrieval_failed", error, retrieval_type="overview")
@@ -424,7 +478,7 @@ async def generate_answer(question: str, history: list[ChatMessage], sources: li
         log_event(8, "generation_fallback_selected", reason="provider_not_configured")
         answer = fallback_answer(question, sources)
         log_event(9, "candidate_response_generated", source="extractive_fallback", response_chars=len(answer))
-        debug_digest("candidate_response", answer)
+        debug_preview("candidate_answer", answer)
         return answer
 
     from openai import AsyncOpenAI
@@ -458,6 +512,18 @@ async def generate_answer(question: str, history: list[ChatMessage], sources: li
     prompt_chars = sum(len(str(message["content"])) for message in messages)
     log_event(7, "prompt_constructed", prompt_chars=prompt_chars, messages=len(messages))
     debug_digest("prompt", "\n".join(str(message["content"]) for message in messages))
+    debug_preview("prompt_base_instruction", str(messages[0]["content"]))
+    debug_preview("prompt_socratic_instruction", str(messages[1]["content"]))
+    debug_preview("prompt_format_instruction", str(messages[2]["content"]))
+    if settings.DEBUG_PIPELINE_LOGS:
+        log_event(
+            "debug",
+            "prompt_inputs",
+            history_roles=",".join(item.role for item in history[-8:]) or "none",
+            history_messages=len(history[-8:]),
+            retrieved_chunks=len(sources),
+            question_chars=len(question),
+        )
 
     try:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -477,9 +543,28 @@ async def generate_answer(question: str, history: list[ChatMessage], sources: li
             latency_ms=round((monotonic() - llm_started) * 1000),
         )
         log_event(9, "candidate_response_generated", source="llm", response_chars=len(raw_answer))
-        debug_digest("candidate_response", raw_answer)
+        debug_preview("candidate_answer", raw_answer)
         answer = enforce_socratic_response(raw_answer, question, socratic_decision)
-        log_event(10, "response_validated", result="accepted" if answer == raw_answer.strip() else "adjusted")
+        changed = answer != raw_answer.strip()
+        adjustment = "none"
+        if changed:
+            if socratic_decision.strategy == "diagnostic_recall":
+                adjustment = "diagnostic_question_substituted"
+            elif raw_answer.count("?") == 0:
+                adjustment = "missing_question_repaired"
+            elif raw_answer.count("?") > 1:
+                adjustment = "multiple_questions_reduced"
+            else:
+                adjustment = "socratic_length_or_disclosure_policy"
+        log_event(
+            10,
+            "response_validated",
+            result="adjusted" if changed else "accepted",
+            adjustment=adjustment,
+            candidate_questions=raw_answer.count("?"),
+            final_questions=answer.count("?"),
+        )
+        debug_preview("validated_answer", answer)
         return answer
     except Exception as error:
         # Keep the course chatbot useful if the generation provider is temporarily unavailable,
@@ -490,6 +575,8 @@ async def generate_answer(question: str, history: list[ChatMessage], sources: li
             LOGGER.exception("%s answer generation failed; returning the grounded fallback answer.", provider)
         fallback = fallback_answer(question, sources)
         log_event(9, "candidate_response_generated", source="grounded_fallback", response_chars=len(fallback))
+        debug_preview("candidate_answer", fallback)
         answer = enforce_socratic_response(fallback, question, socratic_decision)
         log_event(10, "response_validated", result="accepted" if answer == fallback.strip() else "adjusted")
+        debug_preview("validated_answer", answer)
         return answer
